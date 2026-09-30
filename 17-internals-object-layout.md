@@ -29,17 +29,31 @@ box[orange] POD (Plain Old Data)
 -->
 ```
    +-----------------------------------------------------------------+
-   | TRIVIAL          : can be copied with memcpy; no custom ctor/   |
-   |                    dtor/copy; trivially default-constructible.  |
+   | TRIVIAL          : trivial default ctor, plus trivially         |
+   |                   copyable. A trivial default ctor does nothing.|
+   |-----------------------------------------------------------------|
+   | TRIVIALLY        : the memcpy permission. Copy/move ctor and    |
+   | COPYABLE         : assign are trivial or deleted, at least one  |
+   |                    copy or move ctor is not deleted, same for   |
+   |                    assignment, and the destructor is trivial.   |
+   |                    A virtual function, a string member, or a    |
+   |                    user-provided copy ends this.                |
    |-----------------------------------------------------------------|
    | STANDARD-LAYOUT  : layout matches an equivalent C struct.       |
-   |   * no virtual functions or virtual bases                       |
+   |   * no virtual functions, no virtual bases                      |
+   |   * no reference members                                        |
    |   * all non-static data members have the SAME access control    |
-   |   * no non-standard-layout bases; at most one class in the      |
-   |     hierarchy has data members                                  |
-   |   -> offsetof() is legal; safe to share with C; reinterpret ok  |
+   |   * every member and base is standard-layout                    |
+   |   * at most one class in the hierarchy contributes data:        |
+   |     either the most-derived class has all the data and no base  |
+   |     has data, or exactly one base has data and the most-derived |
+   |     class has none                                              |
+   |   * the type of the first non-static data member is not a base  |
+   |     (that collision would break empty-base optimization)        |
+   |   -> offsetof() is defined; first member is at offset 0         |
    |-----------------------------------------------------------------|
-   | POD = TRIVIAL and STANDARD-LAYOUT (the classic "C struct").     |
+   | POD              : an old term. In modern C++, "trivial and     |
+   |                   standard-layout" is the property people mean. |
    +-----------------------------------------------------------------+
 ```
 
@@ -55,8 +69,40 @@ static_assert(!std::is_standard_layout_v<B>);
 static_assert(!std::is_standard_layout_v<C>);
 ```
 
-Why you care: only **standard-layout** types give you `offsetof`, guaranteed
-"first member at offset 0", and safe interop with C / `memcpy` / serialization.
+Why you care: only **standard-layout** types give you `offsetof` and a
+guaranteed "first member at offset 0." Only **trivially copyable** types may
+be copied with `memcpy`. A type can be one and not the other.
+
+```cpp
+struct MixedAccess {          // trivially copyable, not standard-layout
+private:
+    int a;
+public:
+    int b;
+};
+struct Logged {               // standard-layout, not trivially copyable
+    int x;
+    ~Logged() {}              // user-provided destructor
+};
+```
+
+`MixedAccess` may be copied with `memcpy` and may not be passed to
+`offsetof`. `Logged` may use `offsetof` and may not be `memcpy`'d: the
+user-provided destructor ends trivial copyability even though the body is
+empty. A `const int` member deletes copy *assignment* and does not, by
+itself, end trivial copyability — the copy constructor can still be trivial.
+A virtual function ends both properties. Do not `memcpy` a `std::string`.
+
+### Common initial sequence
+
+Standard-layout structs that are layout-compatible in their leading members
+share a **common initial sequence**. If those structs are members of a
+union, reading that leading sequence through the inactive member is defined.
+That is the one union type-pun the language blesses, and it is how some
+allocators and tagged frames are written. It is not a license to overlay a
+`float` and an `int`. Prefer `std::variant` or `std::bit_cast` (C++20, for
+types of the same size that are trivially copyable) when the intent is to
+reinterpret a value.
 
 ---
 
@@ -229,9 +275,10 @@ use assignment. It's also why `std::is_standard_layout` matters for serializatio
 ## 7. Reference & bitfield layout notes
 
 ```
-   * References are NOT objects; a T& member is typically stored as a pointer
-     (implementation detail) and makes the class non-standard-layout-ish for
-     copy purposes (reference members can't be reseated -> no copy assignment).
+   * References are not objects. A T& member is stored as a pointer on every
+     ABI you will meet, the class is not standard-layout (reference members
+     are excluded by the standard), and copy assignment is deleted because a
+     reference cannot be reseated.
    * Bitfields pack multiple fields into one storage unit:
        struct Flags { unsigned a:1, b:1, c:6; };  // often 1 byte total
      Bitfield layout (order within the unit, straddling) is largely
@@ -275,8 +322,11 @@ Runnable: [`examples/ch17_ebo.cpp`](examples/ch17_ebo.cpp).
 
 ```
  +------------------------------------------------------------------+
- | Layout categories: trivial (memcpy-able), standard-layout (C     |
- |   compatible, offsetof-legal), POD = both.                       |
+ | Trivially copyable: memcpy is defined. Trivial: that, plus a     |
+ |   trivial default constructor. Standard-layout: C-compatible,    |
+ |   offsetof-legal, no virtuals, no reference members, at most one |
+ |   class in the hierarchy has the data. You can be one and not    |
+ |   the other. POD, loosely, means both.                           |
  | Members laid out in DECLARATION order; padding aligns each; size |
  |   rounds up to alignof. Reorder big->small to cut padding.       |
  | Itanium ABI: vptr at offset 0; adding a virtual grows the object |
@@ -285,6 +335,8 @@ Runnable: [`examples/ch17_ebo.cpp`](examples/ch17_ebo.cpp).
  | C++20 [[no_unique_address]]: EBO for MEMBERS.                    |
  | Tail-padding reuse: derived members may live in a base's trailing|
  |   padding (non-standard-layout only) -> don't memcpy base parts. |
+ | Common initial sequence: the one defined union type-pun, and     |
+ |   only for the leading layout-compatible members.                |
  | Inspect with sizeof/alignof/offsetof and -fdump-record-layouts.  |
  +------------------------------------------------------------------+
 ```

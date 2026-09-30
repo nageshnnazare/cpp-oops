@@ -119,7 +119,25 @@ box[green] CRTP (compile-time)
    cost and you DON'T need a heterogeneous runtime collection. Common for
    mixins, static interfaces, and expression templates.
    NOTE: C++23 "deducing this" (chapter 14) replaces many CRTP uses more cleanly.
+   An explicit object parameter cannot be virtual, which matches CRTP: both
+   are compile-time mechanisms.
 ```
+
+`Shape<Circle>` and `Shape<Square>` are unrelated types. There is no `Shape*`
+that can point at either. A heterogeneous container means virtual functions or
+`std::variant`, not CRTP.
+
+`static_cast<const Derived*>(this)` is unchecked. `struct Circle : Shape<Square>`
+compiles and then uses the wrong type the first time `area()` runs: that is
+undefined behavior, not a failed cast. The pattern's contract is "the template
+argument is the most derived class." A `static_assert` on
+`std::derived_from<Derived, Shape<Derived>>` has to wait until `Derived` is
+complete; people usually put it in a member function body, not in the base
+class body, because the derived class is still incomplete while the base is
+being instantiated from the base-clause.
+
+A CRTP base that contains data is not free in size. The zero-overhead claim is
+about the call. Adding a virtual function to the CRTP base puts the vptr back.
 
 Runnable: [`examples/ch23_crtp.cpp`](examples/ch23_crtp.cpp).
 

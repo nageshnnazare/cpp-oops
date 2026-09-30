@@ -1,269 +1,459 @@
 # 15 — Pitfalls & Best Practices
 
-A field guide to the OOP bugs that bite everyone, and the habits that prevent
-them. Most of these have appeared earlier; this is the consolidated checklist.
+This is the catalogue. Each entry is a bug that compiles, what it actually
+does, and the fix. The surrounding chapters are the long version.
 
 ---
 
-## 1. Missing virtual destructor (leak / UB)
+## 1. Non-virtual destructor, polymorphic delete
 
 ```cpp
-struct Base { ~Base(); };                 // NON-virtual dtor
-struct Derived : Base { std::vector<int> big; ~Derived(); };
+struct Base { ~Base(); };
+struct Derived : Base { std::vector<int> data; };
 Base* p = new Derived();
-delete p;                                 // only ~Base runs -> ~Derived skipped -> UB/leak
+delete p;                              // undefined behavior
 ```
 
-```
-   RULE: a class used polymorphically (deleted via Base*) MUST have a virtual
-   destructor. If a class has ANY virtual function, give it a virtual dtor.
-   Alternatively: make the base dtor protected+non-virtual to FORBID
-   delete-through-base (used when you never delete polymorphically).
-```
+`delete` uses the static type when the destructor is not virtual. `~Derived`
+does not run. `data` leaks, and the standard calls the whole delete undefined.
+
+Fix: `virtual ~Base() = default;` if `Base*` is an owning pointer. Or a
+protected non-virtual `~Base()` so `delete` on a `Base*` does not compile
+(chapter 06, chapter 19).
 
 ---
 
-## 2. Object slicing
+## 2. Slicing
 
 ```cpp
 std::vector<Animal> zoo;
-zoo.push_back(Dog{});          // sliced to Animal — Dog part lost
-Animal a = someDog;            // sliced copy
-void feed(Animal a);           // by VALUE -> slices any derived argument
-feed(someDog);                 // Dog-ness gone inside feed
+zoo.push_back(Dog{"Rex"});             // copies the Animal subobject only
+void feed(Animal a);                   // parameter is a different Animal
 ```
 
-```
-   Slicing happens whenever a derived object is copied into a BASE VALUE.
-   FIX: pass/store by reference or pointer for polymorphism:
-     void feed(const Animal& a);                    // no slice
-     std::vector<std::unique_ptr<Animal>> zoo;      // no slice
-```
+Fix: `const Animal&`, `unique_ptr<Animal>`, or `variant<Dog, Cat>`. Protect
+the base copy constructor if slicing should be ill-formed (chapter 05,
+chapter 04).
 
 ---
 
-## 3. Calling virtual functions in constructors/destructors
+## 3. Virtual call in a constructor or destructor
 
 ```cpp
-struct Base { Base(){ setup(); } virtual void setup(); };   // calls Base::setup!
+struct Base {
+    Base() { setup(); }                // dynamic type is Base here
+    virtual void setup() { /* Base */ }
+};
 ```
 
-```
-   During Base's ctor/dtor the object is (still/again) only a Base, so virtual
-   calls resolve to Base's version, NOT the derived override. Avoid virtual calls
-   in ctors/dtors, or use a separate init() called after construction.
-```
+The derived override does not run. Derived members are not initialized yet.
+A call to a pure virtual in this window is undefined and typically aborts in
+`__cxa_pure_virtual`. Fix: do derived work in the derived constructor, after
+the base constructor has returned (chapter 06, chapter 18).
 
 ---
 
-## 4. Forgetting the Rule of Three/Five (shallow copy)
+## 4. Default arguments on virtual functions
 
 ```cpp
-class Buf { int* p_; public: Buf(int n):p_(new int[n]){} ~Buf(){ delete[] p_; } };
+struct Base    { virtual void f(int x = 1); };
+struct Derived { void f(int x = 2) override; };
+Base& b = derived;
+b.f();                                 // Derived::f(1), not 2
+```
+
+The override is selected dynamically. The default is filled in from the
+static type. Fix: one default, on a non-virtual public function that
+forwards to a virtual function without a default (chapter 06, chapter 07).
+
+---
+
+## 5. Hiding is not overriding
+
+```cpp
+struct Base    { virtual void f() const; };
+struct Derived : Base { void f(); };   // different function, not an override
+```
+
+`Base& b = d; b.f();` calls `Base::f`. Fix: `override` on every intended
+override. The missing `const` becomes a compile error (chapter 06).
+
+---
+
+## 6. Rule of Three / Five, shallow copy
+
+```cpp
+class Buf {
+    int* p_;
+public:
+    explicit Buf(int n) : p_(new int[n]) {}
+    ~Buf() { delete[] p_; }
+};
 Buf a(10);
-Buf b = a;    // default copy = shallow -> a.p_ == b.p_ -> DOUBLE FREE at scope end
+Buf b = a;                             // copies p_; both delete it
 ```
 
-```
-   If you write a destructor that frees a resource, you MUST also handle copy
-   (and move). Better: use RAII members (unique_ptr/vector) -> Rule of Zero,
-   the compiler does it correctly. (Chapter 04.)
-```
+The user-declared destructor also suppressed the move operations, so
+`std::move(a)` copies too. Fix: Rule of Zero with `vector` or `unique_ptr`,
+or write all five special members, moves `noexcept` (chapter 04).
 
 ---
 
-## 5. Self-assignment and self-move
+## 7. Self-assignment and self-move
 
 ```cpp
 T& operator=(const T& o) {
-    delete p_;                  // if &o == this, you just freed the source!
-    p_ = new U(*o.p_);          // ...then read freed memory -> UB
+    delete p_;                         // o and *this are the same object
+    p_ = new U(*o.p_);                 // o.p_ is already freed
     return *this;
 }
 ```
 
-```
-   Guard with 'if (this != &o)' OR use copy-and-swap (chapter 04 §7), which is
-   inherently self-assignment safe and exception safe.
-```
+Fix: allocate the new resource before releasing the old one, or test
+`this != &o`, or take the parameter by value and swap (chapter 04).
+Self-move (`a = std::move(a)`) must leave `a` valid. Destroy-then-steal
+without the identity test does not.
 
 ---
 
-## 6. Returning references/pointers to locals or destroyed members
+## 8. `return std::move(local)`
 
 ```cpp
-const std::string& name() const { return std::string("x"); }  // DANGLING: temp dies
-int& at(int i) { int local = data_[i]; return local; }        // DANGLING: local dies
+Buffer make() {
+    Buffer local(10);
+    return std::move(local);           // blocks NRVO
+}
 ```
 
-```
-   Never return a reference/pointer to a local or a temporary. Return by value,
-   or reference a member that outlives the call. Watch dangling references from
-   'auto& x = obj.method_returning_temporary();'.
-```
+Fix: `return local;`. The language moves if it does not elide. Reserve
+`return std::move(x)` for a parameter or another expression that is not a
+local automatic object (chapter 04).
 
 ---
 
-## 7. Inheriting to reuse (wrong is-a) & LSP violations
+## 9. Forwarding-reference constructor steals the copy
 
 ```cpp
-class Stack : public std::vector<int> {};   // Stack is NOT a vector -> leaks API
-class Square : public Rectangle {};         // breaks setWidth/setHeight contract
+template <class S>
+Widget(S&& s) : name_(std::forward<S>(s)) {}
+
+Widget a("a");
+Widget b(a);                           // S = Widget&, not the copy constructor
 ```
 
-```
-   Use inheritance for genuine IS-A + substitutability, not for code reuse.
-   Prefer composition (chapter 10). If a subclass must throw "unsupported" or
-   weaken a base guarantee, the hierarchy is wrong.
-```
+A non-const lvalue prefers the template to `Widget(const Widget&)`. Fix:
+constrain `S` so it is not `Widget`, or take `std::string` by value
+(chapter 04).
 
 ---
 
-## 8. Fat interfaces & god classes
-
-```
-   * A class with 30 methods and 15 members doing unrelated jobs -> split (SRP).
-   * An interface forcing implementers to stub/throw unused methods -> segregate
-     (ISP). (Chapter 12.)
-```
-
----
-
-## 9. Overusing inheritance depth
-
-```
-   Deep hierarchies (A->B->C->D->E) are rigid and hard to reason about. Each
-   level couples to all ancestors (fragile base class). Prefer shallow trees +
-   composition. "Prefer flat + compose" over "deep + inherit."
-```
-
----
-
-## 10. Public data members / leaking internals
+## 10. Dangling references
 
 ```cpp
-class Account { public: double balance; };   // no invariant protection
+const std::string& name() const { return std::string("x"); }  // temporary dies
+int& at(int i) { int local = data_[i]; return local; }        // local dies
+const std::string& s = BankAccount{"a", 0}.owner();           // account dies
 ```
 
-```
-   Keep data private; expose behavior. A struct of public data is fine for
-   PLAIN data with no invariants, but a class with rules must guard them
-   (chapter 03). Don't return non-const references to private members that let
-   callers bypass your invariants.
-```
+Fix: return by value, or return a reference to a member and do not bind it
+to a temporary object. `string_view` and `span` into a temporary have the
+same shape. If the function returns a view, the caller must own the buffer.
 
 ---
 
-## 11. `explicit` omitted -> surprising conversions
+## 11. Returning a mutable reference to private state
 
 ```cpp
-class Timer { public: Timer(int seconds); };   // implicit
+std::string& Account::owner() { return owner_; }   // bypasses rename()
+```
+
+The invariant "owner is non-empty" is now the caller's problem. Fix: return
+`const std::string&` or a copy. Mutate through a function that checks
+(chapter 03).
+
+---
+
+## 12. `const` that does not reach the pimpl
+
+```cpp
+int Widget::size() const { impl_->mutate(); }      // compiles
+```
+
+`unique_ptr::operator->() const` returns `Impl*`, not `const Impl*`. Fix:
+propagate const, or only call const operations on `*impl_` from const
+methods (chapter 03).
+
+---
+
+## 13. Pimpl destructor defined in the header
+
+```cpp
+class Widget {
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+public:
+    ~Widget() = default;               // inline, Impl is incomplete
+};
+```
+
+Deleting an incomplete type is undefined. Fix: declare `~Widget()` and the
+move operations in the header and default them in the `.cpp` after `Impl` is
+defined (chapter 03).
+
+---
+
+## 14. Inheriting to reuse
+
+```cpp
+class Stack : public std::vector<int> {};
+class Square : public Rectangle {};
+```
+
+`Stack` publishes `insert`. `Square` breaks `set_width`'s postcondition.
+`vector`'s destructor is not virtual. Fix: a member `vector`, and separate
+types for square and rectangle (chapters 10 and 12).
+
+---
+
+## 15. Protected data, and protected access through the wrong object
+
+Protected data makes every derived class part of the representation. Prefer
+private data and protected or public functions.
+
+A derived class may use a protected member through its own type, not through
+an arbitrary `Base&` or a sibling (chapter 03). `b.value_ = 1` inside
+`Derived`, where `b` is a `Base&`, is ill-formed on purpose.
+
+---
+
+## 16. Name hiding
+
+```cpp
+struct Base { void f(int); void f(double); };
+struct Derived : Base { void f(std::string); };
+// d.f(1);                              // error, Base::f is hidden
+```
+
+Fix: `using Base::f;` in `Derived` (chapter 05). This is not virtual
+dispatch. Add `override` when you did mean to override.
+
+---
+
+## 17. Object lifetime and `memcpy`
+
+`memcpy` of a type that is not trivially copyable is undefined. A type with
+a `string`, a `vector`, a virtual function, or a user-provided copy
+constructor is not trivially copyable. Copy it with `=` or with the copy
+constructor. `offsetof` is for standard-layout types (chapter 17).
+
+Tail padding of a base can hold derived members. `memcpy` of the base
+subobject using `sizeof(Base)` can overwrite them. Assign the base, or copy
+the complete object.
+
+---
+
+## 18. `shared_ptr` cycles and `shared_ptr(this)`
+
+```cpp
+struct Node {
+    std::shared_ptr<Node> next;
+    std::shared_ptr<Node> prev;        // cycle if both directions are live
+};
+```
+
+Fix: `weak_ptr` on the back edge. `shared_ptr<T>(this)` inside a member
+creates a second control block and a double free. Fix:
+`enable_shared_from_this`, used only after a `shared_ptr` owns the object,
+never from the constructor (chapter 14).
+
+---
+
+## 19. `shared_ptr` as a default
+
+`shared_ptr` costs an atomic refcount and a control block, and it blurs who
+destroys the object. Fix: `unique_ptr` for ownership, `T&` or `T*` for use.
+Reach for `shared_ptr` when two owners genuinely outlive each other's scopes.
+
+---
+
+## 20. Static initialization order
+
+A namespace-scope object in `a.cpp` whose constructor uses a namespace-scope
+object in `b.cpp` may run first. The order across translation units is
+unspecified. Fix: a function-local static, which C++11 initializes once in a
+thread-safe way (chapter 11). Do not call back into that function from its
+own constructor.
+
+---
+
+## 21. Throwing destructors
+
+Destructors are implicitly `noexcept`. A throw from a `noexcept` destructor
+calls `std::terminate`. A throw during stack unwinding calls `std::terminate`
+even if the destructor is `noexcept(false)`. Fix: destructors do not throw.
+Log the failure, or store it, and finish releasing the resource (chapter 02).
+
+---
+
+## 22. Constructor failure leaks raw acquisitions
+
+If the constructor throws after a raw `fopen` and before the object exists,
+the destructor does not run. Fix: acquire into a RAII member so the member's
+destructor runs when the constructor fails (chapter 02).
+
+---
+
+## 23. Missing `explicit`
+
+```cpp
+struct Timer { Timer(int seconds); };
 void wait(Timer);
-wait(5);                                        // 5 silently -> Timer(5). Surprise!
+wait(5);                               // Timer(5), silently
 ```
 
-```
-   Mark single-argument constructors 'explicit' unless implicit conversion is
-   genuinely wanted (chapter 02). Same for conversion operators (chapter 09).
-```
+Fix: `explicit` on converting constructors and on conversion operators,
+except where the conversion is the type's actual model (chapter 02,
+chapter 09).
 
 ---
 
-## 12. `shared_ptr` cycles (memory leak despite RAII)
+## 24. Overloading `&&`, `||`, or comma
+
+The built-in operators short-circuit and sequence their operands. The
+overloads are ordinary function calls. Both sides run. Fix: do not overload
+them (chapter 09).
+
+---
+
+## 25. `initializer_list` stealing a constructor
 
 ```cpp
-struct Node { std::shared_ptr<Node> next; std::shared_ptr<Node> prev; };
-// a->next = b; b->prev = a;  -> refcounts never reach 0 -> LEAK
+std::vector<int> a(10, 2);             // ten 2s
+std::vector<int> b{10, 2};             // two elements: 10 and 2
 ```
 
-```
-   Two shared_ptrs pointing at each other keep each other alive forever.
-   FIX: make one direction a weak_ptr (typically the "back"/parent pointer):
-     struct Node { std::shared_ptr<Node> next; std::weak_ptr<Node> prev; };
+Brace initialization prefers an `initializer_list` constructor. Fix: know
+which overload you are calling. Parentheses when you mean the count
+constructor (chapter 02).
+
+---
+
+## 26. Most vexing parse
+
+```cpp
+Widget w();                            // declares a function
+Widget w{};                            // defines an object
 ```
 
 ---
 
-## 13. Overusing `shared_ptr` (when `unique_ptr` suffices)
+## 27. Diamond without `virtual`
+
+Two non-virtual paths to `Animal` produce two `Animal` subobjects and an
+ambiguous `Animal*` conversion. Fix: virtual inheritance on the shared base,
+and initialize that base from the most-derived constructor. Or, more often,
+do not build the diamond (chapter 08).
+
+---
+
+## 28. `reinterpret_cast` across bases
+
+A secondary base does not live at offset 0. `reinterpret_cast` does not add
+the offset. `static_cast` and the implicit conversion do. Cross-casts from
+one sibling to another need `dynamic_cast` (chapters 08 and 20).
+
+---
+
+## 29. `dynamic_cast` and RTTI
+
+`dynamic_cast` on a non-polymorphic type does not do a runtime check down
+the hierarchy; the source must be polymorphic for a runtime cast.
+`typeid(*p)` on a null polymorphic pointer throws `bad_typeid`. A reference
+`dynamic_cast` throws `bad_cast` on failure; the pointer form returns null.
+`-fno-rtti` removes both. Prefer a virtual function to a cast in a loop
+(chapter 21).
+
+---
+
+## 30. Pointer-to-member is not a pointer
+
+A pointer to a member function is often two words (function or vtable index,
+plus a `this` adjustment). Casting it to `void (*)()` is undefined. Use
+`std::invoke` or `std::mem_fn` (chapter 22).
+
+---
+
+## 31. Checklist
 
 ```
-   shared_ptr has overhead (atomic refcount, control block) and blurs ownership
-   ("who owns this?"). Default to unique_ptr (single clear owner); reach for
-   shared_ptr only when ownership is genuinely shared. Pass raw T*/T& for
-   non-owning use.
+   CLASS
+   [ ] Invariant stated. Data private. No mutable escape hatches.
+   [ ] const on every function that does not change observable state.
+   [ ] explicit on converting constructors.
+   [ ] Rule of Zero, or all five special members, moves noexcept.
+   [ ] No raw owning pointer.
+
+   HIERARCHY
+   [ ] Public inheritance only where LSP holds.
+   [ ] virtual destructor, or a protected non-virtual one.
+   [ ] override on overrides. final on leaves that should not grow.
+   [ ] No virtual calls from constructors or destructors.
+   [ ] No default arguments on virtual functions.
+   [ ] No slicing: no by-value base parameters, no vector<Base>.
+
+   OWNERSHIP
+   [ ] unique_ptr by default, shared_ptr with a reason, weak_ptr for back edges.
+   [ ] T& / T* for non-owning use.
+   [ ] Factories return unique_ptr<Interface>.
+   [ ] Pimpl special members defined where Impl is complete.
+
+   MODERN CHOICE
+   [ ] Closed set of types: variant, not a hierarchy.
+   [ ] Open set: virtual.
+   [ ] Comparisons: defaulted <=> when memberwise is the real order.
 ```
 
 ---
 
-## 14. Best-practices checklist
-
-```
-   CLASS DESIGN
-   [ ] Keep data private; expose behavior, protect invariants (ch 03).
-   [ ] const-correct every non-mutating method.
-   [ ] Single-arg ctors 'explicit'; single responsibility per class.
-   [ ] Rule of Zero (RAII members). If not, handle all of Rule of Five.
-   [ ] noexcept move operations.
-
-   INHERITANCE / POLYMORPHISM
-   [ ] Public inheritance only for real is-a + substitutability (LSP).
-   [ ] Virtual destructor on polymorphic bases.
-   [ ] 'override' on every override; 'final' where appropriate.
-   [ ] No virtual calls in ctors/dtors.
-   [ ] Prefer composition over inheritance for reuse.
-
-   RESOURCES / MODERN
-   [ ] Smart pointers, never raw new/delete; unique_ptr by default.
-   [ ] Break shared_ptr cycles with weak_ptr.
-   [ ] Return by value (move/RVO); sink params by value + std::move.
-   [ ] Closed set of types -> std::variant; open -> virtual.
-   [ ] C++20 <=> for comparisons; program to interfaces (DIP).
-
-   TESTING / QUALITY
-   [ ] Depend on abstractions so you can inject mocks (DIP).
-   [ ] Build with -Wall -Wextra; run with sanitizers (asan/ubsan).
-```
-
----
-
-## 15. Tooling that catches OOP bugs
-
-```
-   -Wall -Wextra                 : warns on -Wreorder, hidden overrides, etc.
-   -Wnon-virtual-dtor            : flags missing virtual destructors
-   -fsanitize=address            : use-after-free, double-free, leaks (slicing
-                                   fallout), buffer overruns
-   -fsanitize=undefined          : UB (bad casts, null deref, etc.)
-   clang-tidy                    : modernize-*, cppcoreguidelines-* checks
-   -Weffc++                      : Meyers-style class hygiene warnings (noisy)
-```
+## 32. Tooling
 
 ```bash
-clang++ -std=c++20 -Wall -Wextra -Wnon-virtual-dtor -fsanitize=address,undefined \
-        prog.cpp -o prog && ./prog
+clang++ -std=c++20 -Wall -Wextra -Wnon-virtual-dtor -Woverloaded-virtual \
+        -fsanitize=address,undefined prog.cpp -o prog && ./prog
 ```
+
+```
+   -Wall -Wextra              reorder, unused, a lot of real bugs
+   -Wnon-virtual-dtor         polymorphic base with a public non-virtual dtor
+   -Woverloaded-virtual       a derived function hides a base virtual
+   -fsanitize=address         use-after-free, double free, leaks
+   -fsanitize=undefined       bad casts, null deref, signed overflow
+   clang-tidy                 modernize-*, cppcoreguidelines-*
+```
+
+Sanitizers change codegen and slow the program down. Use them in tests, not
+as the only production build. They do not catch every slicing bug: a sliced
+copy is a well-defined `Animal`, it is just the wrong one. The type system
+and the checklist catch that one.
 
 ---
 
-## 16. Summary
+## 33. Summary
 
 <!--diagram
 title: Pitfalls & best practices
-box[red] Top OOP bugs
-  text: missing **virtual dtor**, **slicing**, **virtual-in-ctor**, shallow copy (rule of 3/5), self-assignment, dangling returns, wrong **is-a / LSP** breaks, `shared_ptr` cycles, missing `explicit`
-box[green] Habits that prevent them
-  text: private data + behavior, **const-correct**, **Rule of Zero**, virtual dtor + `override`, **composition over inheritance**, smart pointers (`unique_ptr` by default), program to interfaces, use warnings + sanitizers
+box[red] Bugs that compile
+  text: non-virtual delete, slicing, virtual call in a constructor, static default arguments, missing override, shallow copy, self-assignment, dangling return, shared_ptr cycles, cross-TU static init, incomplete-type pimpl destructor
+box[green] Habits
+  text: private data, const, explicit, Rule of Zero, virtual destructor plus override, composition, unique_ptr, variant for a closed set, warnings and sanitizers
 -->
 ```
  +-------------------------------------------------------------------+
- | Top OOP bugs: missing virtual dtor, slicing, virtual-in-ctor,     |
- |   shallow copy (rule of 3/5), self-assignment, dangling returns,  |
- |   wrong is-a / LSP breaks, shared_ptr cycles, missing 'explicit'. |
- |                                                                   |
- | Habits: private data + behavior, const-correct, Rule of Zero,     |
- |   virtual dtor + override, composition over inheritance, smart    |
- |   pointers (unique by default), program to interfaces, use        |
- |   warnings + sanitizers.                                          |
+ | The bugs that compile are listed above, each with the chapter     |
+ | that fixes it. The short habits: private data, const, explicit,   |
+ | Rule of Zero, virtual destructor, override, no virtual calls in   |
+ | ctors, composition for reuse, unique_ptr for ownership, variant   |
+ | for a closed set, -Wall -Wextra and sanitizers in tests.          |
  +-------------------------------------------------------------------+
 ```
 

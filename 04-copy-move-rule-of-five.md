@@ -1,286 +1,375 @@
 # 04 — Copy, Move & the Rule of 0/3/5
 
-Because C++ objects are **values** (chapter 00), what happens when you copy or
-move one is fundamental. Getting the "special member functions" right is where a
-lot of correctness (and performance) lives. This chapter demystifies them.
+C++ objects are values. Copying and moving them is not a library feature; it
+is what initialization and assignment *mean*. The six special member functions
+are how a class takes control of that meaning. The modern default is to take
+control of none of them.
 
 Prereq: [02-constructors-destructors.md](02-constructors-destructors.md).
 
 ---
 
-## 1. The six special member functions
-
-The compiler can auto-generate these six:
+## 1. The six special members
 
 ```cpp
 class T {
-    T();                              // 1. default constructor
-    ~T();                             // 2. destructor
-    T(const T&);                      // 3. copy constructor
-    T& operator=(const T&);           // 4. copy assignment
-    T(T&&) noexcept;                  // 5. move constructor       (C++11)
-    T& operator=(T&&) noexcept;       // 6. move assignment        (C++11)
+public:
+    T();                         // default constructor
+    ~T();                        // destructor
+    T(const T&);                 // copy constructor
+    T& operator=(const T&);      // copy assignment
+    T(T&&) noexcept;             // move constructor
+    T& operator=(T&&) noexcept;  // move assignment
 };
 ```
 
 ```
-   CONSTRUCTION (make a new object):        ASSIGNMENT (overwrite existing):
-     copy ctor:  T b = a;                     copy assign:  b = a;
-     move ctor:  T b = std::move(a);          move assign:  b = std::move(a);
+   Construction builds a new object. Assignment replaces an existing one.
+
+   T b = a;                 copy constructor     (a is an lvalue)
+   T b = std::move(a);      move constructor     (a is cast to an rvalue)
+   b = a;                   copy assignment
+   b = std::move(a);        move assignment
+   T b = make();            neither, if make() returns a prvalue (see §7)
 ```
+
+The default constructor is not part of the Rule of Five. It is suppressed by
+any user-declared constructor, independently of copy and move.
 
 ---
 
-## 2. Copy vs move — the intuition
+## 2. Value categories, as far as copy and move need them
+
+Every expression is one of:
 
 ```
-   COPY: duplicate the source; source stays intact ("photocopy").
-   MOVE: steal the source's guts; leave source empty-but-valid ("hand over").
+   lvalue     a named object, *p, a function, a string literal
+              "has identity, cannot be moved from implicitly"
+   prvalue    a temporary that initializes an object: 42, make(), T{}
+              "has no identity yet; C++17 initializes the destination directly"
+   xvalue     an expiring object: std::move(a), a member of an expiring object
+              "has identity, and we are allowed to steal from it"
 
-   Copy of a vector {1,2,3}:            Move of a vector {1,2,3}:
-     src: [1,2,3] ---------> dst        src: [1,2,3] ---\
-     src still [1,2,3]                                    >  dst: [1,2,3]
-     (allocated a new buffer, copied)   src: [] (empty)  /
-                                        (just swapped the internal pointer!)
+   glvalue = lvalue or xvalue        (has identity)
+   rvalue  = prvalue or xvalue       (can bind to T&&)
 ```
 
-```
-   Move is an OPTIMIZATION: for types owning heap data (string, vector, unique_ptr)
-   moving is O(1) pointer-swaps instead of O(n) deep copy. It's used automatically
-   for rvalues (temporaries, std::move'd values).
-```
-
----
-
-## 3. lvalues, rvalues, and `std::move`
+Overload resolution for the special members:
 
 ```
-   lvalue: has a name / an address you can take   (int x;  x is an lvalue)
-   rvalue: a temporary, about to expire            (x + 1, foo(), std::move(x))
-
-   Overload resolution:
-     T(const T&)   binds to lvalues (copy)
-     T(T&&)        binds to rvalues (move)
+   T(const T&)    binds to lvalues, and also to rvalues if no T(T&&) exists
+   T(T&&)         binds to rvalues only
 ```
 
 ```cpp
 std::string a = "hello";
-std::string b = a;             // a is an lvalue -> COPY constructor
-std::string c = a + " world";  // 'a + " world"' is an rvalue -> MOVE constructor
-std::string d = std::move(a);  // std::move CASTS a to rvalue -> MOVE (a now empty)
+std::string b = a;               // lvalue: copy
+std::string c = a + " world";    // prvalue: initializes c directly (C++17)
+std::string d = std::move(a);    // xvalue: move; a is valid but unspecified
 ```
 
+`std::move` does not move. It is a cast to an rvalue reference:
+
+```cpp
+template <class T>
+constexpr std::remove_reference_t<T>&& move(T&& t) noexcept {
+    return static_cast<std::remove_reference_t<T>&&>(t);
+}
 ```
-   std::move does NOT move anything! It's just a cast to an rvalue reference,
-   which lets the MOVE overload be selected. After std::move(a), 'a' is in a
-   "valid but unspecified" state — don't use its value, but you may reassign it.
-```
+
+After `std::move(a)`, the name `a` still refers to the same object. The move
+happens only if a move constructor or move assignment actually runs and steals
+the resources. Using `a`'s value afterward is legal only to the extent the
+type's moved-from contract allows. The standard library's contract is **valid
+but unspecified**: you may assign a new value, you may destroy, you may call
+functions with no precondition. You may not assume it is empty, except where
+a specific type says so. `std::unique_ptr` does say so: a moved-from
+`unique_ptr` is null. `std::vector` does not promise to be empty.
+
+`std::forward<T>(t)` is the other cast. It preserves the value category of a
+forwarding reference. You use it in templates that pass an argument on,
+not in ordinary special members.
 
 ---
 
-## 4. The Rule of Zero (the goal)
+## 3. What the compiler generates
 
-**If your class doesn't manage a raw resource, declare NONE of the six.** Let the
-compiler generate them, and rely on members (`std::string`, `std::vector`,
-`std::unique_ptr`) that already handle copy/move/destroy correctly.
+This table is the one to memorize. "User-declared" includes `= default` and
+`= delete`.
+
+```
+   you declare                         implicit copy              implicit move
+   ----------------------------------  -------------------------  -------------------------
+   nothing                             declared                   declared
+   destructor                          declared (deprecated)      not declared
+   copy constructor                    (you declared it)          not declared
+   copy assignment                     (you declared it)          not declared
+   move constructor                    defined as deleted         (you declared it)
+   move assignment                     defined as deleted         (you declared it)
+```
+
+Two consequences that cause real bugs:
+
+1. A user-declared destructor **suppresses the move operations**. They are
+   not declared, so a "move" silently selects the copy constructor. A class
+   that frees a raw pointer in its destructor and forgets to declare a move
+   will deep-copy on `std::move`, or fail to compile if the copy is deleted.
+   It will not steal.
+
+2. Declaring a move operation **deletes the copy operations**. A move-only
+   type is what you get from `T(T&&) = default` when a member is move-only
+   (`unique_ptr`), or from declaring a move and not restoring the copy.
+
+If a move is implicitly declared but a member cannot be moved (a `const`
+member, a reference member, or a member whose move is deleted), the move is
+defined as deleted. A deleted move is worse than a missing one: overload
+resolution selects it and then the program is ill-formed, instead of falling
+back to the copy. A class with a `const` member or a reference member is not
+a happy value type. Store values, or store pointers you can reseat.
+
+Defaulted on the first declaration, the special member is trivial when the
+members allow it. Defaulted out of line, it is user-provided and not trivial.
+Trivial copy plus a trivial destructor is what makes a type trivially
+copyable, and trivially copyable is the requirement for `memcpy` of the
+object. A virtual function, a `std::string` member, or a user-provided copy
+constructor all end that permission.
+
+---
+
+## 4. The Rule of Zero
+
+If the class does not directly own a raw resource, declare none of the five
+(destructor, copy constructor, copy assignment, move constructor, move
+assignment). Members that already implement value semantics compose.
 
 ```cpp
-class Person {                     // Rule of Zero: no special members declared
+class Person {
     std::string name_;
     std::vector<int> scores_;
-    std::unique_ptr<Address> addr_;
 public:
-    Person(std::string n) : name_(std::move(n)) {}
-    // copy/move/destroy are all correctly AUTO-generated:
-    //   name_ & scores_ copy/move deeply; addr_ moves (and is non-copyable)
+    explicit Person(std::string n) : name_(std::move(n)) {}
 };
 ```
 
-```
-   RULE OF ZERO: manage resources via RAII MEMBERS, declare no special members.
-   -> The compiler-generated copy/move/dtor "just work" by calling the members'.
-   This is the modern default. Aim for it.
-```
+The compiler-generated copy deep-copies the string and the vector. The
+generated move steals their buffers. The generated destructor destroys both.
+`Person p3 = std::move(p1);` is correct with no code.
 
-```
-   Person p1("Ada");
-   Person p2 = p1;             // deep-copies name_ & scores_...
-                              // ...but addr_ is unique_ptr (non-copyable) ->
-                              // COMPILE ERROR unless you decide copy semantics.
-   Person p3 = std::move(p1); // moves everything cheaply. Works out of the box.
-```
+A `std::unique_ptr` member makes the generated copy deleted and the generated
+move correct. The class becomes move-only, which is the right answer for
+unique ownership. If you wanted deep copy, you would write a copy constructor
+that allocates a new `T` — and then you are in the Rule of Five, because
+declaring the copy suppresses the implicit move and you must restore it.
+
+Aim here. `std::string`, `std::vector`, `std::unique_ptr`, `std::fstream`,
+and `std::lock_guard` exist so your classes can follow the Rule of Zero.
 
 ---
 
-## 5. The Rule of Three (pre-C++11, still relevant)
+## 5. The Rule of Three
 
-**If you need to write ONE of {destructor, copy ctor, copy assignment}, you
-almost certainly need all THREE.** This happens when you manage a raw resource.
+If you manage a raw resource, the destructor, the copy constructor, and the
+copy assignment all three exist, or none of them does. The compiler's copy
+is a memberwise copy. For a pointer, that copies the address.
 
 ```cpp
-class Buffer {                      // manages a raw heap array
+class Buffer {
     int* data_;
     std::size_t size_;
 public:
-    Buffer(std::size_t n) : data_(new int[n]{}), size_(n) {}
+    explicit Buffer(std::size_t n) : data_(new int[n]{}), size_(n) {}
 
-    ~Buffer() { delete[] data_; }                       // 1. destructor
+    ~Buffer() { delete[] data_; }
 
-    Buffer(const Buffer& o) : data_(new int[o.size_]), size_(o.size_) {  // 2. copy ctor
-        std::copy(o.data_, o.data_ + size_, data_);     //   DEEP copy
+    Buffer(const Buffer& o) : data_(new int[o.size_]), size_(o.size_) {
+        std::copy(o.data_, o.data_ + size_, data_);
     }
 
-    Buffer& operator=(const Buffer& o) {                // 3. copy assignment
-        if (this != &o) {                               //   self-assignment check!
-            int* fresh = new int[o.size_];              //   allocate FIRST (safety)
-            std::copy(o.data_, o.data_ + o.size_, fresh);
-            delete[] data_;                             //   free old
-            data_ = fresh; size_ = o.size_;
-        }
+    Buffer& operator=(const Buffer& o) {
+        if (this == &o) return *this;
+        int* fresh = new int[o.size_];          // allocate first
+        std::copy(o.data_, o.data_ + o.size_, fresh);
+        delete[] data_;                         // then release the old
+        data_ = fresh;
+        size_ = o.size_;
         return *this;
     }
 };
 ```
 
-```
-   Why all three? If you only wrote the destructor:
-     Buffer a(10);
-     Buffer b = a;      // compiler's default copy = shallow copy of the POINTER
-     // now a.data_ == b.data_  (same buffer!)
-     // at scope end: ~b deletes data_, then ~a deletes it AGAIN -> DOUBLE FREE.
-   Managing a resource forces you to define copying correctly.
-```
+If only the destructor is user-declared, `Buffer b = a` memberwise-copies
+`data_`. Both objects delete the same array. That is a double free.
 
-```
-   DOUBLE-FREE / SHALLOW-COPY BUG:
-     a: [ptr]---+
-                 >---> [ heap buffer ]     both point to the SAME buffer
-     b: [ptr]---+                          -> both destructors free it -> CRASH
-```
+Assignment is not construction. The left-hand object already owns a buffer.
+The safe order is: allocate the new resource, copy into it, and only then
+release the old one. If `new` throws, `*this` is unchanged (the strong
+exception guarantee). If you `delete[]` first and then `new` throws, the
+object owns a dangling pointer and its destructor will delete it again.
 
-### The self-assignment trap
+### Self-assignment
 
-```cpp
-b = b;   // if operator= did "delete data_; data_ = new...; copy from o"
-         // BUT o IS *this -> you deleted the source before copying it! -> UB
-```
-
-The `if (this != &o)` guard (or copy-and-swap, §7) prevents this.
+`b = b` must be a no-op that leaves `b` valid. The implementation above
+returns early when `this == &o`. Without that test, `delete[]` first would
+free the source before the copy reads it. Copy-and-swap (§8) makes the test
+unnecessary.
 
 ---
 
-## 6. The Rule of Five (C++11+)
+## 6. The Rule of Five
 
-Once you write copy operations and a destructor, the move operations are **not**
-auto-generated. To keep moves efficient, write all **five** (the default ctor is
-separate). Add move ctor & move assignment:
+Declaring the copy operations or the destructor suppresses implicit moves.
+Put the moves back, and mark them `noexcept` when they cannot throw.
+`std::vector` reallocation will move your element only if the move
+constructor is `noexcept`. Otherwise it copies, to keep the strong guarantee
+if a move would throw halfway through the buffer. A throwing move plus a
+vector growth is a silent performance bug, not a compile error.
 
 ```cpp
-    Buffer(Buffer&& o) noexcept                     // 4. move ctor
-        : data_(o.data_), size_(o.size_) {
-        o.data_ = nullptr; o.size_ = 0;             //   leave source empty-valid
+Buffer(Buffer&& o) noexcept
+    : data_(std::exchange(o.data_, nullptr)),
+      size_(std::exchange(o.size_, 0)) {}
+
+Buffer& operator=(Buffer&& o) noexcept {
+    if (this != &o) {
+        delete[] data_;
+        data_ = std::exchange(o.data_, nullptr);
+        size_ = std::exchange(o.size_, 0);
     }
-
-    Buffer& operator=(Buffer&& o) noexcept {        // 5. move assignment
-        if (this != &o) {
-            delete[] data_;                         //   free ours
-            data_ = o.data_; size_ = o.size_;       //   steal theirs
-            o.data_ = nullptr; o.size_ = 0;         //   null out source
-        }
-        return *this;
-    }
+    return *this;
+}
 ```
 
-```
-   MOVE ctor:  steal the pointer, null the source. O(1). NO new allocation.
-     a: [ptr->buf]        moved-from a: [nullptr]
-                    ===>   b: [ptr->buf]   (same buffer, ownership transferred)
+`std::exchange(obj, new_value)` assigns `new_value` and returns the previous
+value. In a move constructor there is no old buffer to free: the object is
+being born, and the initializer list is the initialization.
 
-   Mark moves 'noexcept' — std::vector and others require it to move (not copy)
-   your objects during reallocation (strong exception guarantee). Big perf win.
+Self-move-assignment (`a = std::move(a)`) must leave `a` in a valid state.
+The `this != &o` test does that. Destroy-then-steal without the test is
+unsafe when the two sides are the same object: the destructor of `*this`
+destroys the source you are about to read.
+
+Moved-from `Buffer` is empty: null pointer, size 0. That is a stronger
+contract than the standard library's "valid but unspecified," and it is the
+right contract for a type you designed. Document it. Do not read `data_[0]`
+on a moved-from buffer.
+
+A complete raw-owning class spells out all five, even when some are
+`= default`:
+
+```cpp
+~Widget() = default;
+Widget(const Widget&) = default;
+Widget& operator=(const Widget&) = default;
+Widget(Widget&&) noexcept = default;
+Widget& operator=(Widget&&) noexcept = default;
 ```
 
-```
-   THE COMPLETE PICTURE (Rule of Five):
-     ~Buffer()                 free
-     Buffer(const Buffer&)     deep copy
-     operator=(const Buffer&)  deep copy assign (self-check)
-     Buffer(Buffer&&) noexcept steal
-     operator=(Buffer&&) noexcept steal + free old
-```
+You write that block when a member forces you to declare one of them (the
+pimpl incomplete-type destructor in chapter 03) and you want the others to
+stay compiler-generated. Declaring the destructor out of line without
+declaring the moves would silently turn moves into copies.
 
 Runnable: [`examples/ch04_rule_of_five.cpp`](examples/ch04_rule_of_five.cpp).
 
 ---
 
-## 7. Copy-and-swap idiom (elegant, self-assign-safe)
+## 7. Copy elision
 
-A slick way to write assignment once, correctly, using the copy ctor + a `swap`:
+C++17 **guarantees** that a prvalue used to initialize an object of the same
+type does not create a temporary and does not call the copy or move
+constructor. The copy constructor need not even be accessible:
 
 ```cpp
-class Buffer {
-    // ... data_, size_, dtor, copy ctor, move ctor as above ...
-    friend void swap(Buffer& a, Buffer& b) noexcept {
-        using std::swap;
-        swap(a.data_, b.data_);
-        swap(a.size_, b.size_);
-    }
-
-    // ONE assignment operator handles BOTH copy and move assignment:
-    Buffer& operator=(Buffer other) noexcept {   // NOTE: take BY VALUE
-        swap(*this, other);                       // steal from the copy/move
-        return *this;
-    }                                             // 'other' (old state) dies here
-};
+Buffer make() {
+    return Buffer(10);     // initializes the caller's object directly
+}
+Buffer b = make();         // still one object, not three
 ```
 
-```
-   b = a;              // 'other' is a COPY of a  -> swap -> b has a's data
-   b = std::move(a);   // 'other' is MOVED from a -> swap -> b has a's data
-   b = b;              // 'other' is a copy of b -> swap with itself's copy -> safe
+Named return value optimization is different. In `return local;`, where
+`local` is an automatic object, the compiler *may* construct `local` in the
+return slot. It is not required to. If it does not, the language treats
+`local` as an rvalue for overload resolution, so the move constructor is
+selected. You do not write `return std::move(local);`. That cast blocks
+NRVO and, for a type that is only copyable, can also block the implicit move
+and force a copy... actually for a local variable, `return std::move(local)`
+selects the move and prevents elision. Prefer the bare `return local;`.
 
-   By taking the parameter BY VALUE, the copy/move is done by the compiler
-   (using the copy/move ctor), and swap can't throw -> automatically:
-     * self-assignment safe
-     * exception safe (strong guarantee: if the copy throws, *this is untouched)
-     * one function serves copy AND move assignment
-```
+The one place `return std::move` is right: returning a parameter, or
+returning something that is not a local automatic object. Parameters are not
+eligible for NRVO in the way people hope, and a by-value parameter should be
+moved out explicitly if you want the move.
 
 ---
 
-## 8. What the compiler generates (the rules table)
+## 8. Copy-and-swap
+
+One assignment operator can serve as both copy and move assignment:
+
+```cpp
+friend void swap(Buffer& a, Buffer& b) noexcept {
+    using std::swap;
+    swap(a.data_, b.data_);
+    swap(a.size_, b.size_);
+}
+
+Buffer& operator=(Buffer other) noexcept {   // by value: copy OR move
+    swap(*this, other);
+    return *this;
+}                                             // other destroys the old state
+```
 
 ```
-   If you declare...            then the compiler...
-   ---------------------------  --------------------------------------------
-   nothing                      generates all 6 (Rule of Zero) — best case
-   a destructor                 still gives copy (deprecated) but NOT moves*
-   a copy ctor/assign           does NOT generate moves (they fall back to copy)
-   a move ctor/assign           deletes the copy operations (move-only type)
-   = default                    generates the standard version explicitly
-   = delete                     forbids that operation
-
-   * Declaring a destructor (or any copy op) SUPPRESSES implicit MOVE generation.
-     So a class with a user destructor silently COPIES on "move" -> perf trap.
-     -> If you write ANY of the five, explicitly handle ALL of them (= default
-        the ones you don't customize).
+   b = a;              other is copy-constructed from a, then swapped in
+   b = std::move(a);   other is move-constructed from a, then swapped in
+   b = b;              other is a copy of b; swap exchanges b with that copy
 ```
 
-```
-   Common modern pattern — spell out intent even when using defaults:
-     ~Widget() = default;
-     Widget(const Widget&) = default;
-     Widget& operator=(const Widget&) = default;
-     Widget(Widget&&) noexcept = default;
-     Widget& operator=(Widget&&) noexcept = default;
-```
+If the copy constructor throws, `operator=` has not started modifying
+`*this`. That is the strong guarantee. `swap` of two pointers does not
+throw, so the `noexcept` is honest. The cost is an extra move when the
+right-hand side is an lvalue: copy into `other`, swap, destroy `other`. For
+a buffer that is already a heap allocation, the extra pointer swaps are
+noise next to the allocation. For a type where you can do better (reuse
+capacity when `size()` fits), a hand-written assignment is the right tool.
+Copy-and-swap is the default when you want correctness without thinking
+about self-assignment.
+
+Define `swap` as a non-member in the same namespace, `noexcept`, and
+implement it with `using std::swap; swap(a.member, b.member);` so a member
+type's own ADL `swap` is found. A member `swap` is optional sugar that the
+free function can call.
 
 ---
 
-## 9. Move-only types
+## 9. Exception safety, three levels
 
-Some types should be movable but not copyable (unique ownership): `unique_ptr`,
-`thread`, `fstream`, `mutex`(not even movable). Express it with `= delete`:
+```
+   nothrow (no-throw)    the operation does not throw. Destructors, noexcept
+                         moves, pointer swaps.
+   strong                the operation completes, or the object is unchanged.
+                         copy-and-swap assignment. vector reallocation when
+                         the element move is noexcept, or when it copies.
+   basic                 the invariant holds, but the value may have changed.
+                         a sequence of pushes that throws on the third one.
+   none                  the invariant may be broken. Do not ship this.
+```
+
+A function offers the strong guarantee by doing the work that might throw on
+the side, then committing with only nothrow operations. That is the same
+shape as "allocate, then delete the old buffer."
+
+`noexcept` on a function is both a contract and an optimization. If a
+`noexcept` function throws, `std::terminate` is called and the stack is not
+unwound in the usual way. Put it on moves and swaps that truly cannot throw.
+Do not put it on a copy that allocates.
+
+---
+
+## 10. Move-only types
+
+Some resources have one owner. Delete the copy operations and define the
+moves, or embed a `unique_ptr` and follow the Rule of Zero.
 
 ```cpp
 class Socket {
@@ -289,50 +378,167 @@ public:
     explicit Socket(int fd) : fd_(fd) {}
     ~Socket() { if (fd_ != -1) ::close(fd_); }
 
-    Socket(const Socket&) = delete;             // no copying a socket
+    Socket(const Socket&) = delete;
     Socket& operator=(const Socket&) = delete;
 
-    Socket(Socket&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }      // movable
+    Socket(Socket&& o) noexcept : fd_(std::exchange(o.fd_, -1)) {}
     Socket& operator=(Socket&& o) noexcept {
-        if (this != &o) { if (fd_!=-1) ::close(fd_); fd_ = o.fd_; o.fd_ = -1; }
+        if (this != &o) {
+            if (fd_ != -1) ::close(fd_);
+            fd_ = std::exchange(o.fd_, -1);
+        }
         return *this;
     }
 };
 ```
 
-```
-   Move-only = delete copies, define moves. The resource has exactly ONE owner
-   at a time; ownership transfers on move. (This IS how unique_ptr works.)
-```
+The moved-from socket holds `-1`, and the destructor treats `-1` as "no
+file descriptor." Pick a sentinel and stick to it. `std::unique_ptr`,
+`std::fstream`, and `std::jthread` are move-only for this reason.
+`std::mutex` is neither copyable nor movable.
 
 ---
 
-## 10. Summary
+## 11. Copying a polymorphic object
+
+A compiler-generated copy of a base slices (chapter 05). If a hierarchy
+needs value copies, give it a virtual `clone`:
+
+```cpp
+class Shape {
+public:
+    virtual std::unique_ptr<Shape> clone() const = 0;
+    virtual ~Shape() = default;
+};
+
+class Circle : public Shape {
+    double r_;
+public:
+    explicit Circle(double r) : r_(r) {}
+    std::unique_ptr<Shape> clone() const override {
+        return std::make_unique<Circle>(*this);
+    }
+};
+```
+
+The override returns `unique_ptr<Shape>`. A covariant raw-pointer return
+(`Circle* clone() const override` when the base returns `Shape*`) exists in
+the language, and chapter 06 covers it. Prefer `unique_ptr` so ownership is
+in the signature. The base copy and move should be protected or deleted so
+callers do not slice by accident:
+
+```cpp
+class Shape {
+protected:
+    Shape() = default;
+    Shape(const Shape&) = default;
+    Shape& operator=(const Shape&) = default;
+    Shape(Shape&&) noexcept = default;
+    Shape& operator=(Shape&&) noexcept = default;
+public:
+    virtual std::unique_ptr<Shape> clone() const = 0;
+    virtual ~Shape() = default;
+};
+```
+
+Protected copy operations let `Circle`'s copy constructor invoke `Shape`'s,
+and they stop `Shape a = some_circle;` outside the hierarchy.
+
+---
+
+## 12. A templated constructor is not a copy constructor
+
+A copy constructor is a non-template constructor with a particular signature.
+This template is a converting constructor, and it wins overload resolution
+for a non-const lvalue:
+
+```cpp
+class Widget {
+    std::string name_;
+public:
+    template <class S>
+    explicit Widget(S&& s) : name_(std::forward<S>(s)) {}
+};
+Widget a("a");
+Widget b(a);     // instantiates Widget(Widget&), not the copy constructor
+                 // then std::forward tries to construct a string from a Widget
+```
+
+The template is a better match than `Widget(const Widget&)` because `Widget&`
+binds to `a` with less qualification than `const Widget&`. Constrain it:
+
+```cpp
+template <class S>
+    requires std::constructible_from<std::string, S>
+          && (!std::same_as<std::remove_cvref_t<S>, Widget>)
+explicit Widget(S&& s) : name_(std::forward<S>(s)) {}
+```
+
+Or take `std::string` by value, which is the sink-parameter pattern and does
+not have this problem:
+
+```cpp
+explicit Widget(std::string name) : name_(std::move(name)) {}
+```
+
+An lvalue `std::string` is copied into the parameter, then moved into the
+member. An rvalue is moved twice, and moves of `string` are cheap. One
+function handles both.
+
+---
+
+## 13. Exercises
+
+1. You wrote `~Buffer()` and a copy constructor, and you did not mention
+   move. What does `Buffer b = std::move(a);` do?
+2. Why does `std::vector<Buffer>` copy elements on growth when `Buffer`'s
+   move constructor allocates, and move them when it only steals a pointer
+   and is `noexcept`?
+3. `struct S { const int n; std::string name; };` — is the generated move
+   assignment usable? Why?
+4. `return std::move(local);` at the end of a function that returns `local`
+   by value. What optimization does that inhibit?
+
+### Answers
+
+1. The move constructor was not declared, because the user-declared
+   destructor and copy constructor suppressed it. The copy constructor is
+   selected. `a` is unchanged. You paid for a deep copy and you may have
+   expected a steal.
+2. If the move constructor is not `noexcept`, `vector` copies so that a
+   throw leaves the original buffer intact (the strong guarantee). A
+   `noexcept` move cannot throw, so `vector` moves. Mark non-throwing moves
+   `noexcept`.
+3. Move assignment is defined as deleted. `const int n` cannot be reseated
+   or assigned. The class can be constructed but not assigned.
+4. Named return value optimization. A bare `return local;` can construct
+   `local` directly into the caller's return slot, and if the compiler
+   declines, it still implicit-moves. `std::move` forces the move and blocks
+   the elision.
+
+---
+
+## 14. Summary
 
 <!--diagram
 title: Copy, move & the rule of 0/3/5
 box[green] Key points
-  text: Six special members: default ctor, dtor, copy ctor/assign, move ctor/assign
-  text: **COPY** duplicates; **MOVE** steals (O(1)) and leaves source valid-empty. `std::move` is just a cast to rvalue (enables the move overload)
-  text: **RULE OF ZERO**: own resources via RAII members; declare none (the modern default — aim for it)
-  text: **RULE OF THREE**: dtor + copy ctor + copy assign go together
-  text: **RULE OF FIVE**: add move ctor + move assign (mark `noexcept`!). Writing a dtor **suppresses** implicit moves → handle all five
-  text: Copy-and-swap: one by-value `operator=` → safe copy AND move. Move-only: `= delete` copies, define moves (unique ownership)
+  text: Rule of Zero — own resources through RAII members and declare no special members
+  text: A user-declared destructor or copy suppresses implicit move, so a "move" becomes a copy. Declaring a move deletes the copy
+  text: std::move is a cast. Moved-from standard types are valid but unspecified. Mark non-throwing moves noexcept so vector will use them
+  text: C++17 elides prvalue copies. Do not std::move a local return value. Copy-and-swap gives self-assignment safety and the strong guarantee
+  text: Polymorphic copies go through a virtual clone. A forwarding-reference constructor is not a copy constructor and will steal non-const lvalues
 -->
 ```
  +-------------------------------------------------------------------+
- | Six special members: default ctor, dtor, copy ctor/assign,        |
- |   move ctor/assign.                                               |
- | COPY duplicates; MOVE steals (O(1)) and leaves source valid-empty.|
- | std::move is just a cast to rvalue (enables the move overload).   |
- |                                                                   |
- | RULE OF ZERO: own resources via RAII members; declare none.       |
- |   (the modern default — aim for it)                               |
- | RULE OF THREE: dtor + copy ctor + copy assign go together.        |
- | RULE OF FIVE: add move ctor + move assign (mark noexcept!).       |
- |   Writing a dtor SUPPRESSES implicit moves -> handle all five.    |
- | Copy-and-swap: one by-value operator= -> safe copy AND move.      |
- | Move-only: = delete copies, define moves (unique ownership).      |
+ | Rule of Zero: RAII members, no special members declared.          |
+ | User-declared dtor or copy => no implicit move (silent copies).   |
+ | User-declared move => copy is deleted.                            |
+ | std::move is a cast. Moved-from library objects: valid,           |
+ |   unspecified. noexcept on non-throwing moves (vector cares).     |
+ | C++17 elides prvalues. return local; not return std::move(local). |
+ | Copy-and-swap: strong guarantee, self-assignment safe.            |
+ | Hierarchies copy via virtual clone(). Constrain templated ctors.  |
  +-------------------------------------------------------------------+
 ```
 

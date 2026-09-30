@@ -174,11 +174,17 @@ void* top = dynamic_cast<void*>(a);   // address of the whole D
 
 ```
    Compiling with -fno-rtti:
-     * removes type_info emission -> smaller binaries.
-     * DISABLES dynamic_cast (to polymorphic types) and typeid on polymorphic
-       lvalues -> compile error / UB if used.
+     * removes type_info emission and the RTTI pointers in vtables -> smaller
+       binaries. The vptr and virtual dispatch stay. RTTI is not the vtable.
+     * DISABLES dynamic_cast (runtime checks) and typeid on polymorphic
+       lvalues. Those programs fail to compile.
      * common in embedded / game engines / LLVM itself (which uses its own
-       lightweight RTTI: llvm::isa<>/dyn_cast<> built on a manual 'classof' tag).
+       lightweight RTTI: llvm::isa<>/dyn_cast<> built on a manual classof tag,
+       usually an enum in the object).
+
+   -fno-exceptions is a different switch. It does not remove vtables. It
+   removes throw and the unwind tables. Do not link a translation unit built
+   with exceptions to one built without them and then throw across the boundary.
 
    If you find yourself wanting -fno-rtti but still needing type queries, that's
    the sign to build a lightweight tagged hierarchy (an enum 'kind' + isa<>)
